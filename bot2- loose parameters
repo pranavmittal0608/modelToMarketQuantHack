@@ -1,0 +1,1020 @@
+# ==============================================================================
+# MT5 PRECISION BOT v5 — HTF TREND + STRUCTURE PULLBACK + CONFIDENCE SIZING
+# ==============================================================================
+#
+# CHANGES FROM v4:
+#   1. Confidence scoring replaces the binary gate. Every signal that reaches
+#      the scoring stage gets a 0.0-1.0 confidence number built from how
+#      strong each condition is (not just whether it passed a threshold).
+#      Risk per trade then scales with confidence: weak-but-valid setups get
+#      a small slice of risk, strong setups get more. Nothing below the
+#      confidence floor trades at all — loosening entries does not mean
+#      "trade everything", it means "score everything that clears a lower
+#      bar, then size by how good it actually is."
+#   2. Slightly loosened hard gates (ADX, RSI bands, level tolerance) so more
+#      setups reach the scoring stage. The gates that protect against true
+#      chop (ADX) and against trading with no edge (R:R) are NOT removed.
+#   3. SL/TP VERIFICATION + WATCHDOG. Every order is checked after sending to
+#      confirm the broker actually attached SL/TP. If not, the bot retries
+#      with an explicit modify request. A watchdog pass runs every cycle and
+#      re-applies SL/TP to any open position from this bot that's missing
+#      either one. This is aimed squarely at "I have to close manually" —
+#      if that was caused by silently-dropped SL/TP, this fixes it without
+#      you touching the terminal.
+#   4. BREAKEVEN-PLUS TRAILING. Once a trade reaches +1R, SL moves to
+#      entry + small buffer (locks in no-loss). At +1.75R, SL trails to
+#      lock in +0.75R. This protects winners automatically — another common
+#      reason people start manually closing trades (fear of giving back
+#      profit). It is a managed exit, not a discretionary one: same rule,
+#      every trade, no judgment calls.
+#   5. Daily loss budget now throttles size as realized loss approaches the
+#      halt threshold, instead of trading full risk right up to the cliff.
+#
+# Everything else (H1 trend filter, structural pullback detection, M5
+# rejection trigger) is unchanged in spirit — confidence scoring sits on top
+# of it, it doesn't replace the underlying logic.
+# ==============================================================================
+
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+from enum import Enum
+
+import MetaTrader5 as mt5  # type: ignore[import-untyped]
+
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+class Cfg:
+    SYMBOLS = ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY",
+               "XAUUSD", "BTCUSD", "ETHUSD"]
+
+    # ── Risk sizing (confidence-scaled) ───────────────────────────────────────
+    RISK_MIN_PCT       = 0.003   # 0.3% equity — weakest tradeable confidence
+    RISK_MID_PCT       = 0.007   # 0.7% equity — moderate confidence
+    RISK_MAX_PCT       = 0.010   # 1.0% equity — strongest confidence
+    CONF_FLOOR         = 0.42    # below this, no trade at all regardless of size
+    CONF_MID           = 0.55    # confidence level mapped to RISK_MID_PCT
+    CONF_MAX           = 0.85    # confidence level (and above) mapped to RISK_MAX_PCT
+
+    MAX_RR             = 2.6     # Minimum reward:risk ratio to enter (was 2.5 — see TP logic below;
+                                  # lower floor still requires a >40% win rate to break even, and
+                                  # actual R:R achieved is scored into confidence, so a 1.6:1 setup
+                                  # sizes smaller than a 3:1 setup automatically)
+    PREFERRED_RR        = 3.6    # if a real structural level supports this R:R, use it instead
+    MAX_TRADES_PER_DAY = 10      # Per symbol (was 2 — confidence sizing makes a 3rd safe)
+    MAX_OPEN_TOTAL     = 14       # Never hold more than 4 simultaneous positions
+    DAILY_LOSS_HALT    = 0.04    # Stop all trading if day loss >= 4%
+    DAILY_LOSS_THROTTLE_START = 0.025  # start shrinking size once loss exceeds this
+    LOSS_COOLDOWN_S    = 1800    # 30 min cooldown per symbol after a loss
+
+    # HTF trend detection (H1 bars)
+    # H1_BARS must comfortably exceed EMA_SLOW_H1, or ema() either returns
+    # nothing (len < period -> [] -> every symbol rejects at step 1, every
+    # cycle, forever) or returns a single raw average with zero smoothing
+    # applied yet (len == period) — technically non-empty but not a real EMA.
+    # 300 bars gives EMA200 ~100 bars of runway to actually smooth, which is
+    # what makes it a meaningful slow-trend filter rather than a coin flip.
+    H1_BARS       = 300
+    EMA_FAST_H1   = 50
+    EMA_SLOW_H1   = 200
+    ADX_PERIOD    = 14
+    ADX_MIN       = 15           # was 22 — lets moderately-trending markets through;
+                                  # weak trend strength is penalized in the score, not blocked
+    ADX_STRONG    = 32           # ADX at/above this scores full marks
+
+    # Pullback zone: how close price must be to the EMA50 to count as "at level"
+    PULLBACK_ATR_TOLERANCE = 2.4 # was 1.5 — wider catchment, scored by actual distance
+
+    # M5 entry timing
+    M5_BARS       = 40
+    RSI_PERIOD_M5 = 14
+    RSI_BUY_MAX   = 48          # was 38 — wider band, scored by how extreme it is
+    RSI_SELL_MIN  = 52           # was 62
+
+    # Swing detection
+    SWING_LOOKBACK = 8
+
+    # ATR-based SL padding
+    SL_ATR_BUFFER  = 0.4
+
+    # Breakeven-plus trailing (in units of R, where R = initial SL distance)
+    BREAKEVEN_TRIGGER_R = 1.0    # at +1R, move SL to entry + LOCK_BUFFER_R
+    BREAKEVEN_LOCK_R    = 0.1    # lock in +0.1R once breakeven triggers
+    TRAIL_TRIGGER_R     = 1.75   # at +1.75R, trail SL to lock TRAIL_LOCK_R
+    TRAIL_LOCK_R        = 0.75
+
+    MAGIC   = 202608
+    TF_H1   = mt5.TIMEFRAME_H1  # type: ignore[attr-defined]
+    TF_M5   = mt5.TIMEFRAME_M5  # type: ignore[attr-defined]
+    LOOP_S  = 10                 # Check every 10 seconds
+    DEBUG   = True                # Prints exactly where each symbol fails each cycle.
+                                   # Set False once you've diagnosed the bottleneck —
+                                   # it's noisy with 7 symbols every 10s.
+
+
+# ==============================================================================
+# HELPERS
+# ==============================================================================
+class Side(Enum):
+    BUY  = "BUY"
+    SELL = "SELL"
+
+
+def pip(symbol: str) -> float:
+    if "JPY" in symbol:   return 0.01
+    if symbol == "XAUUSD": return 0.1
+    if symbol == "BTCUSD": return 1.0
+    if symbol == "ETHUSD": return 0.1
+    if symbol == "SOLUSD": return 0.01
+    return 0.0001
+
+
+def contract_size(symbol: str) -> float:
+    if symbol in ("BTCUSD", "ETHUSD", "SOLUSD"): return 1.0
+    if symbol == "XAUUSD":  return 100.0
+    return 100_000.0
+
+
+def ema(prices: List[float], period: int) -> List[float]:
+    if len(prices) < period:
+        return []
+    k   = 2.0 / (period + 1)
+    out = [sum(prices[:period]) / period]
+    for p in prices[period:]:
+        out.append(p * k + out[-1] * (1 - k))
+    return out
+
+
+def rsi(closes: List[float], period: int = 14) -> float:
+    if len(closes) < period + 2:
+        return 50.0
+    d = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    g = [max(x, 0.0) for x in d]
+    l = [abs(min(x, 0.0)) for x in d]
+    ag = sum(g[:period]) / period
+    al = sum(l[:period]) / period
+    for i in range(period, len(d)):
+        ag = (ag * (period - 1) + g[i]) / period
+        al = (al * (period - 1) + l[i]) / period
+    return 100.0 if al == 0 else 100.0 - 100.0 / (1 + ag / al)
+
+
+def atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
+    if len(highs) < period + 1:
+        return 0.0
+    trs = [max(highs[i] - lows[i],
+               abs(highs[i] - closes[i-1]),
+               abs(lows[i]  - closes[i-1]))
+           for i in range(1, len(highs))]
+    a = sum(trs[:period]) / period
+    for t in trs[period:]:
+        a = (a * (period - 1) + t) / period
+    return a
+
+
+def adx(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
+    """Returns ADX value — measures trend strength regardless of direction."""
+    if len(highs) < period * 2:
+        return 0.0
+    plus_dm, minus_dm, tr_list = [], [], []
+    for i in range(1, len(highs)):
+        h_diff = highs[i] - highs[i-1]
+        l_diff = lows[i-1] - lows[i]
+        plus_dm.append(max(h_diff, 0.0) if h_diff > l_diff else 0.0)
+        minus_dm.append(max(l_diff, 0.0) if l_diff > h_diff else 0.0)
+        tr_list.append(max(highs[i] - lows[i],
+                           abs(highs[i]  - closes[i-1]),
+                           abs(lows[i]   - closes[i-1])))
+
+    def wilder_smooth(data: List[float], p: int) -> List[float]:
+        s = [sum(data[:p])]
+        for v in data[p:]:
+            s.append(s[-1] - s[-1] / p + v)
+        return s
+
+    str14  = wilder_smooth(tr_list,   period)
+    pdm14  = wilder_smooth(plus_dm,   period)
+    mdm14  = wilder_smooth(minus_dm,  period)
+    dx_vals = []
+    for i in range(len(str14)):
+        if str14[i] == 0:
+            continue
+        pdi = 100 * pdm14[i] / str14[i]
+        mdi = 100 * mdm14[i] / str14[i]
+        dx_vals.append(100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) > 0 else 0.0)
+    if len(dx_vals) < period:
+        return 0.0
+    a_val = sum(dx_vals[:period]) / period
+    for v in dx_vals[period:]:
+        a_val = (a_val * (period - 1) + v) / period
+    return a_val
+
+
+def swing_highs(highs: List[float], n: int = 8) -> List[Tuple[int, float]]:
+    result = []
+    for i in range(n, len(highs) - n):
+        if highs[i] == max(highs[i-n:i+n+1]):
+            result.append((i, highs[i]))
+    return result
+
+
+def swing_lows(lows: List[float], n: int = 8) -> List[Tuple[int, float]]:
+    result = []
+    for i in range(n, len(lows) - n):
+        if lows[i] == min(lows[i-n:i+n+1]):
+            result.append((i, lows[i]))
+    return result
+
+
+def bullish_rejection_strength(o: List[float], h: List[float], l: List[float], c: List[float]) -> float:
+    """
+    Returns 0.0-1.0 strength of bullish reversal structure on the last candle,
+    instead of a hard True/False. Stronger wick ratio / engulf size -> higher score.
+    """
+    if len(c) < 2:
+        return 0.0
+    i = len(c) - 1
+    score = 0.0
+
+    body    = abs(c[i] - o[i])
+    lo_wick = min(o[i], c[i]) - l[i]
+    rng     = h[i] - l[i]
+    # A real candle needs a body that's a meaningful fraction of its range —
+    # otherwise it's a doji/flat bar and shouldn't score as a hammer just
+    # because a tiny wick happens to be nonzero relative to a near-zero body.
+    if rng > 0 and body >= rng * 0.01:
+        wick_ratio   = lo_wick / body
+        close_in_rng = (c[i] - l[i]) / rng
+        if wick_ratio >= 1.3 and close_in_rng > 0.5:
+            score = max(score, min(1.0, (wick_ratio / 3.0) * 0.6 + close_in_rng * 0.4))
+
+    prev_bearish = c[i-1] < o[i-1]
+    curr_bullish = c[i] > o[i]
+    if prev_bearish and curr_bullish and o[i] <= c[i-1] and c[i] >= o[i-1]:
+        prev_body = abs(c[i-1] - o[i-1])
+        cur_body  = abs(c[i] - o[i])
+        engulf_ratio = cur_body / prev_body if prev_body > 0 else 1.0
+        score = max(score, min(1.0, 0.5 + min(engulf_ratio, 2.0) * 0.25))
+
+    return score
+
+
+def bearish_rejection_strength(o: List[float], h: List[float], l: List[float], c: List[float]) -> float:
+    """Mirror of bullish_rejection_strength for SELL setups."""
+    if len(c) < 2:
+        return 0.0
+    i = len(c) - 1
+    score = 0.0
+
+    body    = abs(c[i] - o[i])
+    hi_wick = h[i] - max(o[i], c[i])
+    rng     = h[i] - l[i]
+    if rng > 0 and body >= rng * 0.01:
+        wick_ratio   = hi_wick / body
+        close_in_rng = (h[i] - c[i]) / rng
+        if wick_ratio >= 1.3 and close_in_rng > 0.5:
+            score = max(score, min(1.0, (wick_ratio / 3.0) * 0.6 + close_in_rng * 0.4))
+
+    prev_bullish = c[i-1] > o[i-1]
+    curr_bearish = c[i] < o[i]
+    if prev_bullish and curr_bearish and o[i] >= c[i-1] and c[i] <= o[i-1]:
+        prev_body = abs(c[i-1] - o[i-1])
+        cur_body  = abs(c[i] - o[i])
+        engulf_ratio = cur_body / prev_body if prev_body > 0 else 1.0
+        score = max(score, min(1.0, 0.5 + min(engulf_ratio, 2.0) * 0.25))
+
+    return score
+
+
+def lot_size(equity: float, entry: float, sl: float, symbol: str, risk_pct: float) -> float:
+    """Risk exactly risk_pct of equity if SL is hit."""
+    sl_dist = abs(entry - sl)
+    if sl_dist <= 0:
+        return 0.01
+    lots = (equity * risk_pct) / (sl_dist * contract_size(symbol))
+    info = mt5.symbol_info(symbol)  # type: ignore[attr-defined]
+    if info:
+        lots = max(info.volume_min, min(info.volume_max, lots))
+        if info.volume_step > 0:
+            lots = round(round(lots / info.volume_step) * info.volume_step, 8)
+    return max(lots, 0.01)
+
+
+def filling_mode(symbol: str):
+    info = mt5.symbol_info(symbol)  # type: ignore[attr-defined]
+    if not info:
+        return mt5.ORDER_FILLING_IOC  # type: ignore[attr-defined]
+    mask = getattr(info, "filling_mode", 2)
+    if mask & 2: return mt5.ORDER_FILLING_IOC   # type: ignore[attr-defined]
+    if mask & 1: return mt5.ORDER_FILLING_FOK   # type: ignore[attr-defined]
+    return mt5.ORDER_FILLING_RETURN              # type: ignore[attr-defined]
+
+
+def fetch_bars(symbol: str, tf, count: int):
+    """Returns (opens, highs, lows, closes) or None. Logs exactly why on
+    failure — broker connection issue vs. insufficient history for this
+    specific symbol vs. a request for more bars than the broker will serve."""
+    rates = mt5.copy_rates_from_pos(symbol, tf, 0, count)  # type: ignore[attr-defined]
+    if rates is None:
+        dbg(symbol, f"fetch_bars: copy_rates_from_pos returned None for {count} bars "
+                     f"(tf={tf}) — last_error={mt5.last_error()}")  # type: ignore[attr-defined]
+        return None
+    if len(rates) < count // 2:
+        dbg(symbol, f"fetch_bars: got only {len(rates)}/{count} bars requested "
+                     f"(tf={tf}) — broker may not have this much history for this symbol")
+        return None
+    return (
+        [r[1] for r in rates],
+        [r[2] for r in rates],
+        [r[3] for r in rates],
+        [r[4] for r in rates],
+    )
+
+
+def dbg(symbol: str, msg: str):
+    """Diagnostic print, gated by Cfg.DEBUG. Shows exactly where a symbol
+    is being rejected each cycle, so 'no trades' becomes a specific,
+    checkable reason instead of a guess."""
+    if Cfg.DEBUG:
+        print(f"  [dbg] {symbol}: {msg}")
+
+
+def risk_pct_for_confidence(confidence: float) -> float:
+    """
+    Maps confidence (0.0-1.0) to a risk percentage via linear interpolation
+    across three anchor points. Below CONF_FLOOR this should never be called
+    (caller is expected to skip the trade entirely).
+    """
+    if confidence >= Cfg.CONF_MAX:
+        return Cfg.RISK_MAX_PCT
+    if confidence >= Cfg.CONF_MID:
+        # interpolate between RISK_MID_PCT and RISK_MAX_PCT
+        span = Cfg.CONF_MAX - Cfg.CONF_MID
+        frac = (confidence - Cfg.CONF_MID) / span if span > 0 else 1.0
+        return Cfg.RISK_MID_PCT + frac * (Cfg.RISK_MAX_PCT - Cfg.RISK_MID_PCT)
+    # between CONF_FLOOR and CONF_MID
+    span = Cfg.CONF_MID - Cfg.CONF_FLOOR
+    frac = (confidence - Cfg.CONF_FLOOR) / span if span > 0 else 1.0
+    frac = max(0.0, min(1.0, frac))
+    return Cfg.RISK_MIN_PCT + frac * (Cfg.RISK_MID_PCT - Cfg.RISK_MIN_PCT)
+
+
+def daily_throttle_multiplier(stats: "DayStats") -> float:
+    """
+    Shrinks position size as the day's realized loss approaches the halt
+    threshold, instead of trading full size right up to the cliff edge.
+    Returns 1.0 (no throttle) down to ~0.25 as loss approaches the halt.
+    """
+    loss = stats.loss_pct()
+    if loss <= Cfg.DAILY_LOSS_THROTTLE_START:
+        return 1.0
+    span = Cfg.DAILY_LOSS_HALT - Cfg.DAILY_LOSS_THROTTLE_START
+    if span <= 0:
+        return 1.0
+    frac = (loss - Cfg.DAILY_LOSS_THROTTLE_START) / span
+    frac = max(0.0, min(1.0, frac))
+    return 1.0 - frac * 0.75  # shrinks to 0.25x right at the halt boundary
+
+
+# ==============================================================================
+# SIGNAL ANALYSIS WITH CONFIDENCE SCORING
+# ==============================================================================
+@dataclass
+class Signal:
+    symbol:     str
+    side:       Side
+    entry:      float
+    sl:         float
+    tp:         float
+    volume:     float
+    rr:         float
+    confidence: float
+    risk_pct:   float
+    reason:     str
+
+
+def analyse_symbol(symbol: str, equity: float, stats: "DayStats") -> Optional[Signal]:
+    """
+    Full multi-timeframe analysis. Builds a confidence score from how strongly
+    each condition is met. Returns a Signal only if confidence clears
+    Cfg.CONF_FLOOR and R:R clears Cfg.MAX_RR. Position size scales with
+    confidence and with the day's remaining loss budget.
+    """
+
+    # ── STEP 1: H1 trend ─────────────────────────────────────────────────────
+    h1 = fetch_bars(symbol, Cfg.TF_H1, Cfg.H1_BARS)
+    if h1 is None:
+        dbg(symbol, "REJECT — could not fetch H1 bars (check symbol name / history depth on broker)")
+        return None
+    h1_o, h1_h, h1_l, h1_c = h1
+
+    ema50  = ema(h1_c, Cfg.EMA_FAST_H1)
+    ema200 = ema(h1_c, Cfg.EMA_SLOW_H1)
+    if not ema50 or not ema200:
+        dbg(symbol, "REJECT — not enough H1 history for EMA200")
+        return None
+
+    e50  = ema50[-1]
+    e200 = ema200[-1]
+
+    adx_val = adx(h1_h, h1_l, h1_c, Cfg.ADX_PERIOD)
+    if adx_val < Cfg.ADX_MIN:
+        dbg(symbol, f"REJECT — ADX {adx_val:.1f} < floor {Cfg.ADX_MIN} (market is chopping, not trending)")
+        return None  # Still a hard floor — true chop is never tradeable
+
+    # Score ADX strength: ADX_MIN -> 0.0, ADX_STRONG+ -> full marks
+    adx_score = min(1.0, max(0.0, (adx_val - Cfg.ADX_MIN) / (Cfg.ADX_STRONG - Cfg.ADX_MIN)))
+
+    if e50 > e200:
+        trend = Side.BUY
+    elif e50 < e200:
+        trend = Side.SELL
+    else:
+        dbg(symbol, "REJECT — EMA50/200 essentially equal, no clear trend direction")
+        return None
+
+    # Trend separation score: how clearly the EMAs are separated, relative to ATR
+    h1_atr = atr(h1_h, h1_l, h1_c, Cfg.ADX_PERIOD)
+    if h1_atr <= 0:
+        dbg(symbol, "REJECT — ATR is zero, can't size levels/tolerance")
+        return None
+    sep_score = min(1.0, abs(e50 - e200) / (h1_atr * 2.0))
+
+    current_price = h1_c[-1]
+    tolerance     = h1_atr * Cfg.PULLBACK_ATR_TOLERANCE
+
+    # ── STEP 3: Structural level + distance score ─────────────────────────────
+    at_level       = False
+    structural_sl  = 0.0
+    level_desc     = ""
+    level_dist_score = 0.0   # 1.0 = right at the level, 0.0 = at the edge of tolerance
+
+    if trend == Side.BUY:
+        near_ema50 = abs(current_price - e50) <= tolerance
+        if near_ema50 and current_price > e50 * 0.997:
+            at_level         = True
+            structural_sl    = e50 - h1_atr * Cfg.SL_ATR_BUFFER
+            level_desc       = f"H1 EMA50 support ({e50:.5f})"
+            level_dist_score = 1.0 - min(1.0, abs(current_price - e50) / tolerance)
+
+        if not at_level:
+            s_lows = swing_lows(h1_l, Cfg.SWING_LOOKBACK)
+            if s_lows:
+                relevant = [(idx, val) for idx, val in s_lows
+                            if val < current_price and abs(current_price - val) <= tolerance * 1.6]
+                if relevant:
+                    _, level_price = max(relevant, key=lambda x: x[1])
+                    at_level         = True
+                    structural_sl    = level_price - h1_atr * Cfg.SL_ATR_BUFFER
+                    level_desc       = f"H1 swing low retest ({level_price:.5f})"
+                    level_dist_score = 1.0 - min(1.0, abs(current_price - level_price) / (tolerance * 1.6))
+
+    else:  # SELL
+        near_ema50 = abs(current_price - e50) <= tolerance
+        if near_ema50 and current_price < e50 * 1.003:
+            at_level         = True
+            structural_sl    = e50 + h1_atr * Cfg.SL_ATR_BUFFER
+            level_desc       = f"H1 EMA50 resistance ({e50:.5f})"
+            level_dist_score = 1.0 - min(1.0, abs(current_price - e50) / tolerance)
+
+        if not at_level:
+            s_highs = swing_highs(h1_h, Cfg.SWING_LOOKBACK)
+            if s_highs:
+                relevant = [(idx, val) for idx, val in s_highs
+                            if val > current_price and abs(current_price - val) <= tolerance * 1.6]
+                if relevant:
+                    _, level_price = min(relevant, key=lambda x: x[1])
+                    at_level         = True
+                    structural_sl    = level_price + h1_atr * Cfg.SL_ATR_BUFFER
+                    level_desc       = f"H1 swing high retest ({level_price:.5f})"
+                    level_dist_score = 1.0 - min(1.0, abs(current_price - level_price) / (tolerance * 1.6))
+
+    if not at_level:
+        dbg(symbol, f"REJECT — trend is {trend.value} but price (dist to EMA50: "
+                    f"{abs(current_price-e50):.5f}, tolerance: {tolerance:.5f}) isn't at a "
+                    f"pullback level yet — waiting for retracement")
+        return None  # Still mandatory — never buy/sell with no structural reason
+
+    # ── STEP 4: M5 entry timing — rejection strength + RSI score ──────────────
+    m5 = fetch_bars(symbol, Cfg.TF_M5, Cfg.M5_BARS)
+    if m5 is None:
+        dbg(symbol, "REJECT — could not fetch M5 bars")
+        return None
+    m5_o, m5_h, m5_l, m5_c = m5
+
+    rsi_m5 = rsi(m5_c, Cfg.RSI_PERIOD_M5)
+
+    if trend == Side.BUY:
+        rejection_score = bullish_rejection_strength(m5_o, m5_h, m5_l, m5_c)
+        if rejection_score <= 0.0 or rsi_m5 > Cfg.RSI_BUY_MAX:
+            dbg(symbol, f"AT LEVEL ({level_desc}) but no M5 trigger yet — "
+                        f"rejection_score={rejection_score:.2f}, RSI={rsi_m5:.1f} "
+                        f"(need <= {Cfg.RSI_BUY_MAX}) — waiting for reversal candle")
+            return None  # No trigger at all yet — wait. This stays mandatory.
+        # RSI score: more oversold (lower) = stronger signal
+        rsi_score = min(1.0, max(0.0, (Cfg.RSI_BUY_MAX - rsi_m5) / Cfg.RSI_BUY_MAX))
+        entry_side_str = "BUY"
+    else:
+        rejection_score = bearish_rejection_strength(m5_o, m5_h, m5_l, m5_c)
+        if rejection_score <= 0.0 or rsi_m5 < Cfg.RSI_SELL_MIN:
+            dbg(symbol, f"AT LEVEL ({level_desc}) but no M5 trigger yet — "
+                        f"rejection_score={rejection_score:.2f}, RSI={rsi_m5:.1f} "
+                        f"(need >= {Cfg.RSI_SELL_MIN}) — waiting for reversal candle")
+            return None
+        rsi_score = min(1.0, max(0.0, (rsi_m5 - Cfg.RSI_SELL_MIN) / (100.0 - Cfg.RSI_SELL_MIN)))
+        entry_side_str = "SELL"
+
+    # ── STEP 5: Live entry price, SL, then find the best achievable TP ────────
+    tick = mt5.symbol_info_tick(symbol)  # type: ignore[attr-defined]
+    if tick is None or tick.ask <= 0:
+        dbg(symbol, "REJECT — no live tick available")
+        return None
+
+    if trend == Side.BUY:
+        entry = tick.ask
+        sl    = structural_sl
+    else:
+        entry = tick.bid
+        sl    = structural_sl
+
+    sl_d = abs(entry - sl)
+    if sl_d <= 0:
+        dbg(symbol, "REJECT — SL distance computed as zero")
+        return None
+
+    # Prefer a TP at the next real structural level in the trend direction if
+    # one exists and it clears PREFERRED_RR. This is what "Don't trade, wait,
+    # then trade perfectly" actually meant — but demanding it unconditionally
+    # was throwing away every otherwise-valid setup where the next level
+    # happened to be closer than 2.5x risk away. Fall back to a fixed
+    # MAX_RR-multiple target (still a real minimum, just lower) so a good
+    # structure+trigger setup isn't discarded for want of a distant target.
+    fixed_tp = (entry + sl_d * Cfg.MAX_RR) if trend == Side.BUY else (entry - sl_d * Cfg.MAX_RR)
+    tp = fixed_tp
+
+    if trend == Side.BUY:
+        further_levels = [val for _, val in swing_highs(h1_h, Cfg.SWING_LOOKBACK) if val > entry]
+        if further_levels:
+            nearest_target = min(further_levels)
+            candidate_rr = (nearest_target - entry) / sl_d
+            if candidate_rr >= Cfg.PREFERRED_RR:
+                tp = nearest_target
+    else:
+        further_levels = [val for _, val in swing_lows(h1_l, Cfg.SWING_LOOKBACK) if val < entry]
+        if further_levels:
+            nearest_target = max(further_levels)
+            candidate_rr = (entry - nearest_target) / sl_d
+            if candidate_rr >= Cfg.PREFERRED_RR:
+                tp = nearest_target
+
+    rr = abs(tp - entry) / sl_d if sl_d > 0 else 0.0
+    if rr < Cfg.MAX_RR:
+        dbg(symbol, f"AT LEVEL + TRIGGERED but R:R only {rr:.2f}:1 "
+                    f"(need >= {Cfg.MAX_RR}:1) — structural SL too wide for this move, skipping")
+        return None  # R:R floor stays mandatory — never trade a bad R:R no matter how confident
+
+    # R:R quality score: reward R:R comfortably above the minimum (caps at 4:1)
+    rr_score = min(1.0, max(0.0, (rr - Cfg.MAX_RR) / 1.5))
+
+    # ── STEP 6: SL sanity cap ──────────────────────────────────────────────────
+    max_sl_price = 5.0 * 20.0 * pip(symbol)
+    if sl_d > max_sl_price * 5:
+        dbg(symbol, f"REJECT — SL distance {sl_d:.5f} exceeds sanity cap")
+        return None
+
+    # ── STEP 7: Build confidence score ────────────────────────────────────────
+    # Weights sum to 1.0
+    confidence = (
+        0.20 * adx_score +
+        0.10 * sep_score +
+        0.20 * level_dist_score +
+        0.25 * rejection_score +
+        0.10 * rsi_score +
+        0.15 * rr_score
+    )
+
+    if confidence < Cfg.CONF_FLOOR:
+        dbg(symbol, f"AT LEVEL + TRIGGERED + R:R OK, but confidence {confidence:.2f} < "
+                    f"floor {Cfg.CONF_FLOOR} (adx={adx_score:.2f} sep={sep_score:.2f} "
+                    f"level={level_dist_score:.2f} reject={rejection_score:.2f} "
+                    f"rsi={rsi_score:.2f} rr={rr_score:.2f}) — too weak overall, skipping")
+        return None  # Below the floor — genuinely not good enough, skip regardless of size
+
+    # ── STEP 8: Size by confidence and remaining daily loss budget ───────────
+    base_risk = risk_pct_for_confidence(confidence)
+    throttle  = daily_throttle_multiplier(stats)
+    risk_pct  = base_risk * throttle
+
+    volume = lot_size(equity, entry, sl, symbol, risk_pct)
+    if volume <= 0:
+        dbg(symbol, "REJECT — computed lot size <= 0 (check broker volume_min/symbol_info)")
+        return None
+
+    dbg(symbol, f"SIGNAL FOUND — confidence={confidence:.2f}, risk={risk_pct*100:.2f}%, rr={rr:.2f}:1")
+
+    reason = (
+        f"H1 trend={entry_side_str} | ADX={adx_val:.1f} (score {adx_score:.2f}) | "
+        f"Level: {level_desc} (dist score {level_dist_score:.2f}) | "
+        f"M5 rejection score={rejection_score:.2f} | RSI(M5)={rsi_m5:.1f} (score {rsi_score:.2f}) | "
+        f"R:R={rr:.2f}:1 (score {rr_score:.2f}) | "
+        f"CONFIDENCE={confidence:.2f} | risk={risk_pct*100:.2f}% (throttle x{throttle:.2f})"
+    )
+
+    return Signal(
+        symbol=symbol, side=trend, entry=entry, sl=sl, tp=tp,
+        volume=volume, rr=rr, confidence=confidence, risk_pct=risk_pct,
+        reason=reason,
+    )
+
+
+# ==============================================================================
+# EXECUTION — with SL/TP verification
+# ==============================================================================
+def send_order(sig: Signal) -> Optional[int]:
+    tick = mt5.symbol_info_tick(sig.symbol)  # type: ignore[attr-defined]
+    if tick is None:
+        return None
+
+    info   = mt5.symbol_info(sig.symbol)  # type: ignore[attr-defined]
+    digits = info.digits if info else 5
+    sl     = round(sig.sl, digits)
+    tp     = round(sig.tp, digits)
+
+    if sig.side == Side.BUY:
+        otype = mt5.ORDER_TYPE_BUY   # type: ignore[attr-defined]
+        price = tick.ask
+    else:
+        otype = mt5.ORDER_TYPE_SELL  # type: ignore[attr-defined]
+        price = tick.bid
+
+    req = {
+        "action":       mt5.TRADE_ACTION_DEAL,   # type: ignore[attr-defined]
+        "symbol":       sig.symbol,
+        "volume":       float(sig.volume),
+        "type":         otype,
+        "price":        price,
+        "sl":           sl,
+        "tp":           tp,
+        "deviation":    30,
+        "magic":        Cfg.MAGIC,
+        "comment":      f"v5|{sig.side.value}|c={sig.confidence:.2f}|r={sig.risk_pct*100:.1f}%",
+        "type_time":    mt5.ORDER_TIME_GTC,      # type: ignore[attr-defined]
+        "type_filling": filling_mode(sig.symbol),
+    }
+
+    res = mt5.order_send(req)  # type: ignore[attr-defined]
+    print("\n" + "─" * 70)
+    if not (res and res.retcode == mt5.TRADE_RETCODE_DONE):  # type: ignore[attr-defined]
+        err = f"retcode={res.retcode} ({res.comment})" if res else mt5.last_error()  # type: ignore[attr-defined]
+        print(f" ❌ ORDER FAILED  {sig.symbol}: {err}")
+        print("─" * 70)
+        return None
+
+    ticket = res.order
+    sl_p = abs(price - sl) / pip(sig.symbol)
+    tp_p = abs(price - tp) / pip(sig.symbol)
+    print(f" ✅ TRADE OPENED  {sig.symbol} {sig.side.value} "
+          f"{sig.volume:.2f}L @ {price:.5f}  | confidence {sig.confidence:.2f} | "
+          f"risk {sig.risk_pct*100:.2f}%")
+    print(f"    SL: {sl:.5f} ({sl_p:.1f}p)  TP: {tp:.5f} ({tp_p:.1f}p)  R:R {sig.rr:.1f}:1")
+    print(f"    {sig.reason}")
+
+    # ── VERIFY SL/TP actually attached ────────────────────────────────────────
+    # Some brokers/servers silently ignore sl/tp on the initial market order
+    # and require a follow-up TRADE_ACTION_SLTP modify. Check, and fix it now
+    # rather than discovering it later with a naked open position.
+    time.sleep(0.4)
+    pos = _find_position(ticket)
+    if pos is None:
+        print(f"    ⚠  Could not verify position {ticket} immediately after open.")
+    else:
+        needs_fix = (sl != 0 and abs(pos.sl - sl) > 1e-9) or (tp != 0 and abs(pos.tp - tp) > 1e-9)
+        if needs_fix:
+            print(f"    ⚠  SL/TP not attached as sent (got sl={pos.sl}, tp={pos.tp}) — repairing...")
+            _apply_sltp(pos, sl, tp)
+    print("─" * 70)
+    return ticket
+
+
+def _find_position(ticket: int):
+    positions = mt5.positions_get(ticket=ticket)  # type: ignore[attr-defined]
+    if positions and len(positions) > 0:
+        return positions[0]
+    return None
+
+
+def _apply_sltp(pos, sl: float, tp: float) -> bool:
+    """Send a TRADE_ACTION_SLTP modify request to attach/repair SL/TP on an open position."""
+    req = {
+        "action":   mt5.TRADE_ACTION_SLTP,  # type: ignore[attr-defined]
+        "symbol":   pos.symbol,
+        "position": pos.ticket,
+        "sl":       sl,
+        "tp":       tp,
+        "magic":    Cfg.MAGIC,
+    }
+    res = mt5.order_send(req)  # type: ignore[attr-defined]
+    ok = bool(res and res.retcode == mt5.TRADE_RETCODE_DONE)  # type: ignore[attr-defined]
+    if ok:
+        print(f"    ✅ SL/TP repaired for {pos.symbol} #{pos.ticket}: sl={sl} tp={tp}")
+    else:
+        err = f"retcode={res.retcode} ({res.comment})" if res else mt5.last_error()  # type: ignore[attr-defined]
+        print(f"    ❌ SL/TP repair FAILED for {pos.symbol} #{pos.ticket}: {err}")
+    return ok
+
+
+# ==============================================================================
+# WATCHDOG — runs every cycle, fixes missing SL/TP and manages breakeven trail
+# ==============================================================================
+def sltp_watchdog(open_trades: Dict[int, "OpenTrade"]):
+    """
+    For every position opened by this bot:
+      1. If SL or TP is missing/zero, re-apply from our records immediately.
+      2. If price has moved enough in our favor, ratchet SL to breakeven-plus
+         or the trail level. Never moves SL against the position.
+    This removes the need for any manual intervention on exits.
+    """
+    positions = mt5.positions_get()  # type: ignore[attr-defined]
+    if not positions:
+        return
+
+    for p in positions:
+        if p.magic != Cfg.MAGIC:
+            continue
+        trade = open_trades.get(p.ticket)
+        if trade is None:
+            continue  # not one we're tracking (shouldn't normally happen)
+
+        tick = mt5.symbol_info_tick(p.symbol)  # type: ignore[attr-defined]
+        if tick is None:
+            continue
+
+        is_buy   = p.type == mt5.ORDER_TYPE_BUY  # type: ignore[attr-defined]
+        cur_price = tick.bid if is_buy else tick.ask
+        initial_risk = abs(trade.entry - trade.initial_sl)
+        if initial_risk <= 0:
+            continue
+
+        r_multiple = ((cur_price - trade.entry) / initial_risk if is_buy
+                      else (trade.entry - cur_price) / initial_risk)
+
+        # Missing SL/TP repair — highest priority
+        if p.sl == 0 or p.tp == 0:
+            target_sl = p.sl if p.sl != 0 else trade.current_sl
+            target_tp = p.tp if p.tp != 0 else trade.tp
+            print(f"\n ⚠  WATCHDOG: {p.symbol} #{p.ticket} missing SL/TP — repairing.")
+            _apply_sltp(p, target_sl, target_tp)
+            continue
+
+        # Breakeven-plus / trailing logic — only ever tightens, never loosens
+        new_sl = None
+        if r_multiple >= Cfg.TRAIL_TRIGGER_R:
+            locked = trade.entry + (initial_risk * Cfg.TRAIL_LOCK_R if is_buy
+                                     else -initial_risk * Cfg.TRAIL_LOCK_R)
+            if (is_buy and locked > p.sl) or (not is_buy and locked < p.sl):
+                new_sl = locked
+        elif r_multiple >= Cfg.BREAKEVEN_TRIGGER_R:
+            locked = trade.entry + (initial_risk * Cfg.BREAKEVEN_LOCK_R if is_buy
+                                     else -initial_risk * Cfg.BREAKEVEN_LOCK_R)
+            if (is_buy and locked > p.sl) or (not is_buy and locked < p.sl):
+                new_sl = locked
+
+        if new_sl is not None:
+            info   = mt5.symbol_info(p.symbol)  # type: ignore[attr-defined]
+            digits = info.digits if info else 5
+            new_sl = round(new_sl, digits)
+            print(f"\n 🔒 TRAIL: {p.symbol} #{p.ticket} at +{r_multiple:.2f}R — "
+                  f"moving SL {p.sl:.5f} -> {new_sl:.5f}")
+            if _apply_sltp(p, new_sl, p.tp):
+                trade.current_sl = new_sl
+
+
+# ==============================================================================
+# POSITION TRACKING
+# ==============================================================================
+@dataclass
+class OpenTrade:
+    ticket:      int
+    symbol:      str
+    side:        Side
+    entry:       float
+    initial_sl:  float   # original SL distance — used to compute R-multiples, never changes
+    current_sl:  float   # tracks the live SL after trailing
+    tp:          float
+    volume:      float
+
+
+@dataclass
+class DayStats:
+    start_equity:  float
+    realized_pnl:  float         = 0.0
+    trades_total:  int           = 0
+    trades_won:    int           = 0
+    halted:        bool          = False
+    trades_today:  Dict[str,int] = field(default_factory=dict)
+
+    def loss_pct(self) -> float:
+        return max(0.0, -self.realized_pnl / self.start_equity) if self.start_equity > 0 else 0.0
+
+    def can_trade(self, symbol: str) -> bool:
+        return (not self.halted
+                and self.trades_today.get(symbol, 0) < Cfg.MAX_TRADES_PER_DAY)
+
+    def record_trade(self, symbol: str):
+        self.trades_today[symbol] = self.trades_today.get(symbol, 0) + 1
+        self.trades_total += 1
+
+
+class TradeTracker:
+    def __init__(self):
+        self._open: Dict[int, OpenTrade] = {}
+        self._cooldown: Dict[str, float] = {}
+
+    def add(self, t: OpenTrade):
+        self._open[t.ticket] = t
+
+    def open_map(self) -> Dict[int, OpenTrade]:
+        return self._open
+
+    def open_symbols(self) -> set:
+        return {t.symbol for t in self._open.values()}
+
+    def count(self) -> int:
+        return len(self._open)
+
+    def in_cooldown(self, symbol: str) -> bool:
+        ts = self._cooldown.get(symbol)
+        return ts is not None and (time.time() - ts) < Cfg.LOSS_COOLDOWN_S
+
+    def check_closures(self, stats: DayStats):
+        live = set()
+        positions = mt5.positions_get()  # type: ignore[attr-defined]
+        if positions:
+            for p in positions:
+                if p.magic == Cfg.MAGIC:
+                    live.add(p.ticket)
+
+        for ticket in list(self._open):
+            if ticket in live:
+                continue
+            trade = self._open.pop(ticket)
+
+            deals = mt5.history_deals_get(0, int(time.time()))  # type: ignore[attr-defined]
+            pnl   = 0.0
+            if deals:
+                mine = [d for d in deals
+                        if d.magic == Cfg.MAGIC and d.symbol == trade.symbol
+                        and d.entry == 1]
+                if mine:
+                    pnl = mine[-1].profit
+
+            stats.realized_pnl += pnl
+            if pnl > 0:
+                stats.trades_won += 1
+                print(f"\n ✅ CLOSED WIN   {trade.symbol} | P&L: +${pnl:.2f}")
+            else:
+                self._cooldown[trade.symbol] = time.time()
+                print(f"\n ❌ CLOSED LOSS  {trade.symbol} | P&L: ${pnl:.2f} "
+                      f"| Cooldown: {Cfg.LOSS_COOLDOWN_S//60}min")
+
+            if stats.loss_pct() >= Cfg.DAILY_LOSS_HALT and not stats.halted:
+                stats.halted = True
+                print(f"\n 🛑 DAILY LOSS LIMIT {Cfg.DAILY_LOSS_HALT*100:.0f}% HIT — "
+                      f"no new trades today.")
+
+
+# ==============================================================================
+# SYMBOL SETUP
+# ==============================================================================
+def setup_symbols(symbols: List[str]) -> List[str]:
+    ok = []
+    for s in symbols:
+        info = mt5.symbol_info(s)  # type: ignore[attr-defined]
+        if info is None:
+            print(f"⚠  {s}: not found on broker — skipping")
+            continue
+        if not info.visible:
+            mt5.symbol_select(s, True)  # type: ignore[attr-defined]
+        ok.append(s)
+    return ok
+
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+def main():
+    print("=" * 70)
+    print("  PRECISION BOT v5 — HTF Trend + Structure Pullback + Confidence Sizing")
+    print("=" * 70)
+
+    if not mt5.initialize():  # type: ignore[attr-defined]
+        print("❌ MT5 init failed:", mt5.last_error())  # type: ignore[attr-defined]
+        return
+
+    term = mt5.terminal_info()  # type: ignore[attr-defined]
+    if not term.trade_allowed:
+        print("❌ AutoTrading is OFF in MT5. Enable it in the toolbar.")
+        mt5.shutdown()  # type: ignore[attr-defined]
+        return
+
+    symbols = setup_symbols(Cfg.SYMBOLS)
+    if not symbols:
+        print("❌ No symbols available.")
+        mt5.shutdown()  # type: ignore[attr-defined]
+        return
+
+    acc = mt5.account_info()  # type: ignore[attr-defined]
+    if not acc:
+        print("❌ Can't read account.")
+        mt5.shutdown()  # type: ignore[attr-defined]
+        return
+
+    stats   = DayStats(start_equity=float(acc.equity))
+    tracker = TradeTracker()
+
+    print(f"✔  Connected | Balance: ${acc.balance:,.2f} | Equity: ${acc.equity:,.2f}")
+    print(f"   Symbols: {symbols}")
+    print(f"   Risk/trade: {Cfg.RISK_MIN_PCT*100:.1f}%-{Cfg.RISK_MAX_PCT*100:.1f}% "
+          f"(confidence-scaled) | Min R:R: {Cfg.MAX_RR}:1 | "
+          f"Max trades/symbol/day: {Cfg.MAX_TRADES_PER_DAY} | "
+          f"Daily halt: {Cfg.DAILY_LOSS_HALT*100:.0f}%")
+    print(f"   Confidence floor to trade: {Cfg.CONF_FLOOR}")
+    print(f"   Signal logic: H1 trend (EMA50/200 + ADX>{Cfg.ADX_MIN}) -> "
+          f"Pullback to structure -> M5 rejection + RSI -> confidence score -> size")
+    print(f"   Exit management: SL/TP verified on open, watchdog repairs if missing, "
+          f"breakeven at +{Cfg.BREAKEVEN_TRIGGER_R}R, trail at +{Cfg.TRAIL_TRIGGER_R}R")
+    print("\n[WAITING FOR HIGH-CONVICTION SETUPS...]\n")
+
+    cycle = 0
+    while True:
+        try:
+            cycle += 1
+            tracker.check_closures(stats)
+            sltp_watchdog(tracker.open_map())  # runs every cycle regardless of halt status
+
+            if stats.halted:
+                if cycle % 60 == 0:
+                    print(f"[Halted] Daily loss limit reached. "
+                          f"P&L: ${stats.realized_pnl:+,.2f}")
+                time.sleep(Cfg.LOOP_S)
+                continue
+
+            acc_now = mt5.account_info()  # type: ignore[attr-defined]
+            equity  = float(acc_now.equity) if acc_now else stats.start_equity
+
+            open_syms = tracker.open_symbols()
+
+            for symbol in symbols:
+                if symbol in open_syms:
+                    continue
+                if tracker.in_cooldown(symbol):
+                    continue
+                if not stats.can_trade(symbol):
+                    continue
+                if tracker.count() >= Cfg.MAX_OPEN_TOTAL:
+                    break
+
+                sig = analyse_symbol(symbol, equity, stats)
+                if sig is None:
+                    continue
+
+                ticket = send_order(sig)
+                if ticket:
+                    tracker.add(OpenTrade(
+                        ticket=ticket, symbol=sig.symbol, side=sig.side,
+                        entry=sig.entry, initial_sl=sig.sl, current_sl=sig.sl,
+                        tp=sig.tp, volume=sig.volume,
+                    ))
+                    stats.record_trade(sig.symbol)
+
+            wr  = (stats.trades_won / stats.trades_total * 100) if stats.trades_total else 0
+            print(
+                f"[{cycle:>6}] Equity: ${equity:>12,.2f} | "
+                f"Open: {tracker.count()}/{Cfg.MAX_OPEN_TOTAL} | "
+                f"Day P&L: ${stats.realized_pnl:>+9.2f} | "
+                f"Trades: {stats.trades_total} | W%: {wr:.0f}%",
+                end="\r",
+            )
+
+            time.sleep(Cfg.LOOP_S)
+
+        except KeyboardInterrupt:
+            print("\n\n[SHUTDOWN] Stopping...")
+            break
+        except Exception as e:
+            import traceback
+            print(f"\n⚠  Exception: {e}")
+            traceback.print_exc()
+            time.sleep(15.0)
+
+    mt5.shutdown()  # type: ignore[attr-defined]
+    wr = (stats.trades_won / stats.trades_total * 100) if stats.trades_total else 0
+    print(f"\nSession ended | Trades: {stats.trades_total} | "
+          f"Won: {stats.trades_won} ({wr:.0f}%) | "
+          f"P&L: ${stats.realized_pnl:+,.2f}")
+
+
+if __name__ == "__main__":
+    main()
